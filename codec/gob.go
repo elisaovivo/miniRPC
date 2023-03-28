@@ -32,7 +32,7 @@ func (c *GobCodec) ReadBody(body interface{}) error {
 	return c.dec.Decode(body)
 }
 
-func (c *GobCodec) Write(h *Header, body interface{}) error {
+func (c *GobCodec) Write(h *Header, body interface{}) (err error) {
 	defer func() {
 		_ = c.buf.Flush()
 		if err != nil {
@@ -43,7 +43,7 @@ func (c *GobCodec) Write(h *Header, body interface{}) error {
 		log.Println("rpc codec: gob error encoding head: ", err)
 		return err
 	}
-	if err := c.enc.Encode(body); err != nil {
+	if err = c.enc.Encode(body); err != nil {
 		log.Println("rpc codec: gob error encoding body: ", err)
 		return err
 	}
