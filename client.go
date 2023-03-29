@@ -1,10 +1,13 @@
 package miniRPC
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"miniRPC/codec"
+	"net"
 	"net/rpc"
 	"sync"
 )
@@ -30,7 +33,7 @@ type Client struct {
 	mu       sync.Mutex
 	seq      uint64
 	pending  map[uint64]*Call
-	closing  bool
+	closing  bool //客户端是否调用了close函数
 	shutdown bool
 }
 
@@ -38,6 +41,7 @@ var _ io.Closer = (*Client)(nil)
 
 var ErrShutdown = errors.New("connection is shut down")
 
+// 客户端主动关闭
 func (client *Client) Close() error {
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -47,11 +51,15 @@ func (client *Client) Close() error {
 	client.closing = true
 	return client.cc.Close()
 }
+
+// 客户端是否能工作
 func (client *Client) IsAvailable() bool {
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	return !client.shutdown && !client.closing
 }
+
+// 将参数call添加到client.pending中，并更新client.seq
 func (client *Client) registerCall(call *Call) (uint64, error) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -64,6 +72,7 @@ func (client *Client) registerCall(call *Call) (uint64, error) {
 	return call.Seq, nil
 }
 
+// 根据seq，从client.pending中移除对应的call
 func (client *Client) removeCall(seq uint64) *Call {
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -72,6 +81,7 @@ func (client *Client) removeCall(seq uint64) *Call {
 	return call
 }
 
+// 服务端或客户端发生错误时调用，将shutdown设置为true，并将错误信息通知所有pending状态的call
 func (client *Client) terminateCalls(err error) {
 	client.sending.Lock()
 	defer client.sending.Unlock()
@@ -108,4 +118,108 @@ func (client *Client) receive() {
 		}
 	}
 	client.terminateCalls(err)
+}
+
+func NewClient(conn net.Conn, opt *Option) (*Client, error) {
+	f := codec.NewCodecFuncMap[opt.CodecType]
+	if f == nil {
+		err := fmt.Errorf("invalid codec type %s", opt.CodecType)
+		log.Println("rpc client: codec error:", err)
+		return nil, err
+	}
+	if err := json.NewEncoder(conn).Encode(opt); err != nil {
+		log.Println("roc client: options error: ", err)
+		_ = conn.Close()
+		return nil, err
+	}
+	return newClientCodec(f(conn), opt), nil
+}
+
+func newClientCodec(cc codec.Codec, opt *Option) *Client {
+	client := &Client{
+		seq:     1,
+		cc:      cc,
+		opt:     opt,
+		pending: make(map[uint64]*Call),
+	}
+	go client.receive()
+	return client
+}
+
+func parseOptions(opts ...*Option) (*Option, error) {
+	if len(opts) == 0 || opts[0] == nil {
+		return DefaultOption, nil
+	}
+	if len(opts) != 1 {
+		return nil, errors.New("number of options is more than 1")
+	}
+	opt := opts[0]
+	opt.MagicNumber = DefaultOption.MagicNumber
+	if opt.CodecType == "" {
+		opt.CodecType = DefaultOption.CodecType
+	}
+	return opt, nil
+}
+
+func Dial(network, address string, opts ...*Option) (client *Client, err error) {
+	opt, err := parseOptions(opts...)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.Dial(network, address)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if client == nil {
+			_ = conn.Close()
+		}
+	}()
+	return NewClient(conn, opt)
+}
+
+func (client *Client) send(call *Call) {
+	client.sending.Lock()
+	defer client.sending.Unlock()
+
+	var seq, err = client.registerCall(call)
+	if err != nil {
+		call.Error = err
+		call.done()
+		return
+	}
+	client.header.ServiceMethod = call.ServiceMethod
+	client.header.Seq = seq
+	client.header.Error = ""
+
+	if err := client.cc.Write(&client.header, call.Args); err != nil {
+		call := client.removeCall(seq)
+		if call != nil {
+			call.Error = err
+			call.done()
+		}
+
+	}
+
+}
+
+func (client *Client) Go(serviceMethod string, args, reply interface{}, done chan *Call) *Call {
+	if done == nil {
+		done = make(chan *Call, 10)
+	} else if cap(done) == 0 {
+		log.Panic("rpc client: done channel is unbuffered")
+	}
+	call := &Call{
+		ServiceMethod: serviceMethod,
+		Args:          args,
+		Reply:         reply,
+		Done:          done,
+	}
+	client.send(call)
+	return call
+}
+
+func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
+	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
+	return call.Error
 }
